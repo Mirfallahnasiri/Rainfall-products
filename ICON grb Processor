@@ -1,0 +1,101 @@
+import os
+import time
+import h5py
+import rioxarray
+import numpy as np
+import xarray as xr
+import pandas as pd
+import geopandas as gpd
+import cartopy.crs as ccrs
+import matplotlib.pyplot as plt
+import cartopy.feature as cfeature
+from datetime import datetime, timedelta
+
+
+# for Catchment in ["Demer", "Gete", "Bovenschelde"]:
+folder_path = 'path'
+shapeD = gpd.read_file(f"Demer31370.shp").to_crs("EPSG:4326")
+shapeG = gpd.read_file(f"Gete31370.shp").to_crs("EPSG:4326")
+shapeB = gpd.read_file(f"Bovenschelde31370.shp").to_crs("EPSG:4326")
+DFD = pd.DataFrame()
+DFG = pd.DataFrame()
+DFB = pd.DataFrame()
+
+for root, dirs, files in os.walk(folder_path):
+    for item in files:
+        if item.endswith('.grb'):
+            file_path = os.path.join(root, item)
+
+            # current_time = time.time()
+            # elapsed = current_time - previous_time
+            # print(f"{elapsed:.3f}")
+            # previous_time = current_time
+
+            try:
+                DS = xr.open_dataset(file_path, engine="cfgrib")
+                # print(f"Opened: {file_path}")
+                if np.isscalar(DS.coords["time"].values) or DS.coords["time"].size == 1:
+                    ds = DS.copy()
+                    start = pd.to_datetime(DS.coords["time"].values) + timedelta(hours=24)
+                else:
+                    ds = DS.sel(time=DS.time.values[-1])
+                    start = pd.to_datetime(DS.coords["time"].values[-1]) + timedelta(hours=24)
+                # ds = DS.sel(time=DS.time.values[-1])
+                # start = pd.to_datetime(ds.coords["time"].values)
+                var_name = list(ds.data_vars)[0]
+                ds = ds.isel(step=slice(24, 37))
+                ds_diff = ds.diff(dim="step")
+
+                tp = ds_diff.tp
+                factor = 10
+                tp_upsampled_data = tp.values.repeat(factor, axis=1).repeat(factor, axis=2)
+                lat = ds_diff.latitude.values
+                lon = ds_diff.longitude.values
+                dy = np.mean(np.diff(lat))
+                dx = np.mean(np.diff(lon))
+                lat_fine = np.linspace(lat[0] - dy / 2 + dy / factor / 2, lat[-1] + dy / 2 - dy / factor / 2,
+                                       len(lat) * factor)
+                lon_fine = np.linspace(lon[0] - dx / 2 + dx / factor / 2, lon[-1] + dx / 2 - dx / factor / 2,
+                                       len(lon) * factor)
+                tp_upscaled = xr.DataArray(
+                    data=tp_upsampled_data,
+                    dims=("step", "latitude", "longitude"),
+                    coords={"step": tp.step, "latitude": lat_fine, "longitude": lon_fine}, attrs=tp.attrs)
+                tp_upscaled.rio.set_spatial_dims(x_dim="longitude", y_dim="latitude", inplace=True)
+                tp_upscaled.rio.write_crs("EPSG:4326", inplace=True)
+                masked_upscaledD = tp_upscaled.rio.clip(shapeD.geometry, shapeD.crs, drop=True)
+                masked_upscaledG = tp_upscaled.rio.clip(shapeG.geometry, shapeG.crs, drop=True)
+                masked_upscaledB = tp_upscaled.rio.clip(shapeB.geometry, shapeB.crs, drop=True)
+
+                mean_valueD = masked_upscaledD.mean(dim=("latitude", "longitude"))
+                mean_valueG = masked_upscaledG.mean(dim=("latitude", "longitude"))
+                mean_valueB = masked_upscaledB.mean(dim=("latitude", "longitude"))
+
+                time_range = pd.date_range(start=start, periods=len(mean_valueD), freq="h")
+
+                dfD = pd.DataFrame({'time': time_range, 'value': mean_valueD.values})
+                dfG = pd.DataFrame({'time': time_range, 'value': mean_valueG.values})
+                dfB = pd.DataFrame({'time': time_range, 'value': mean_valueB.values})
+
+                DFD = pd.concat([DFD, dfD], ignore_index=True)
+                DFG = pd.concat([DFG, dfG], ignore_index=True)
+                DFB = pd.concat([DFB, dfB], ignore_index=True)
+                del dfD, dfB, dfG
+                del time_range
+                del mean_valueD, mean_valueB, mean_valueG
+                del masked_upscaledD, masked_upscaledB, masked_upscaledG
+                del tp_upscaled
+                del tp
+                del ds_diff
+                del ds
+                os.remove(file_path + ".5b7b6.idx")
+            except Exception as e:
+                print(f"Failed to open {file_path}: {e}")
+
+DFD['value'] = DFD['value'].apply(lambda x: max(x, 0))
+DFB['value'] = DFB['value'].apply(lambda x: max(x, 0))
+DFG['value'] = DFG['value'].apply(lambda x: max(x, 0))
+
+DFD.to_csv(f"rawDemer3rd.csv", index=False)
+DFG.to_csv(f"rawGete3rd.csv", index=False)
+DFB.to_csv(f"rawBovenschelde3rd.csv", index=False)

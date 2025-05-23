@@ -1,0 +1,85 @@
+import os
+import h5py
+import pyproj
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+from affine import Affine
+import matplotlib.pyplot as plt
+from shapely.geometry import box
+from shapely.geometry import Point
+import matplotlib.ticker as mticker
+from matplotlib.patches import Patch
+from rasterio.features import geometry_mask
+
+
+def bytes_to_str(b):
+    return b.decode('utf-8') if isinstance(b, bytes) else b
+
+
+def extract_end_dates_times(filename):
+    results = []
+
+    def find_time_attrs(name, obj):
+        attrs = obj.attrs
+        enddate = attrs.get('enddate')
+        endtime = attrs.get('endtime')
+
+        if enddate is not None or endtime is not None:
+            enddate_str = bytes_to_str(enddate) if enddate is not None else None
+            endtime_str = bytes_to_str(endtime) if endtime is not None else None
+            results.append((name, enddate_str, endtime_str))
+
+    with h5py.File(filename, 'r') as f:
+        f.visititems(find_time_attrs)
+
+    return results
+
+
+months = {"RADQPE1_2024_09": 'HDF files path',
+          "RADQPE2_2024_09": 'HDF files path',
+          "RADQPE1_2025_01": 'HDF files path',
+          "RADQPE2_2025_01": 'HDF files path'}
+
+Catchment = {"Bovenschelde": 'Bovenschelde31370.shp',
+             "Gete": 'Gete31370.shp',
+             "Demer": 'Demer31370.shp'}
+
+for c_key, c_value in Catchment.items():
+    print(c_key)
+    gdf = gpd.read_file(c_value).to_crs(epsg=31370)
+    for m_key, m_value in months.items():
+        print(m_key)
+        hdf_files = [f for f in os.listdir(m_value) if f.endswith('.hdf')]
+
+        extent = [-200000, 500000, -200000, 500000]
+        nx, ny = 700, 700
+
+        xres = (extent[1] - extent[0]) / nx
+        yres = (extent[3] - extent[2]) / ny
+        transform = Affine.translation(extent[0], extent[3]) * Affine.scale(xres, -yres)
+
+        results_list = []
+        for item in hdf_files:
+            item = os.path.join(m_value, item)
+            with h5py.File(item, "r") as f:
+                image_data = f['dataset1/data1/data'][()]
+
+            mask = geometry_mask(geometries=gdf.geometry, invert=True, out_shape=(ny, nx), transform=transform)
+
+            masked_data = np.where(mask, image_data, np.nan)
+            masked_mean = np.nanmean(masked_data)
+
+            metadata = extract_end_dates_times(item)
+            if metadata:
+                _, enddate, endtime = metadata[0]
+                string_value = f"{enddate}{endtime}"
+            else:
+                string_value = os.path.basename(item)
+
+            results_list.append({"time": string_value, "value": masked_mean})
+
+        df = pd.DataFrame(results_list)
+        df['time'] = pd.to_datetime(df['time'].astype(str), format='%Y%m%d%H%M%S')
+
+        df.to_csv(f'{c_key}_{m_key}.csv', index=False)
